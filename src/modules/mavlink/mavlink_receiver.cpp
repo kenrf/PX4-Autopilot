@@ -61,6 +61,11 @@
 #include "mavlink_main.h"
 #include "mavlink_receiver.h"
 
+#include <mbedtls/aes.h>
+#include <mbedtls/platform.h>
+#include <mbedtls/cipher.h>
+#include <string.h>
+
 #include <lib/drivers/device/Device.hpp> // For DeviceId union
 
 #ifdef CONFIG_NET
@@ -68,6 +73,127 @@
 #else
 #define MAVLINK_RECEIVER_NET_ADDED_STACK 0
 #endif
+
+
+
+
+// These macros should match your MAVLink version. For example, for MAVLink v1:
+#ifndef MAVLINK_CORE_HEADER_LEN
+#  define MAVLINK_CORE_HEADER_LEN 6    // Adjust if you use MAVLink v2 (typically 10 bytes)
+#endif
+
+#ifndef MAVLINK_CHECKSUM_LEN
+#  define MAVLINK_CHECKSUM_LEN 2       // e.g. MAVLink v1 uses a 2-byte checksum
+#endif
+
+// Maximum allowed payload length for your MAVLink implementation.
+#ifndef MAVLINK_MAX_PAYLOAD_LEN
+#  define MAVLINK_MAX_PAYLOAD_LEN 255
+#endif
+// The shared encryption key (32 bytes for AES-256)
+extern const uint8_t shared_aes_key[32];
+
+/**
+ * @brief Decrypts the encrypted payload in a MAVLink message using mbedTLS.
+ *
+ * The encrypted payload is structured as:
+ *  - Byte 0: Magic marker (0xAB)
+ *  - Bytes 1 ... IV_SIZE: Initialization vector (IV) for AES-256-CBC
+ *  - Bytes (1 + IV_SIZE) ... end: Ciphertext (encrypted payload with PKCS7 padding)
+ *
+ * If the magic byte is not 0xAB, the function assumes the message is plaintext.
+ *
+ * On success, the function replaces the encrypted payload with the decrypted plaintext
+ * and updates the `msg->len` field accordingly.
+ *
+ * @param msg Pointer to the MAVLink message to decrypt.
+ * @return true if decryption succeeded or was not needed, false if decryption failed.
+ */
+bool decrypt_mavlink_payload(mavlink_message_t *msg)
+{
+    // Configuration constants:
+    static const uint8_t MAGIC = 0xAB;
+    static const size_t IV_SIZE = 16;  // AES-256-CBC requires a 16-byte IV
+
+    // Ensure message length is valid
+    if (msg->len < (MAVLINK_CORE_HEADER_LEN + MAVLINK_CHECKSUM_LEN)) {
+        return false;  // Message is too short to contain a valid payload
+    }
+
+    size_t payload_len = msg->len - (MAVLINK_CORE_HEADER_LEN + MAVLINK_CHECKSUM_LEN);
+    uint8_t *payload = reinterpret_cast<uint8_t*>(msg->payload64);
+
+    // If there is no payload or it does not begin with the expected magic marker, assume plaintext
+    if (payload_len == 0 || payload[0] != MAGIC) {
+        return true;
+    }
+
+    // Check if the payload is large enough to contain IV and ciphertext
+    if (payload_len < (1 + IV_SIZE)) {
+        return false;  // Not enough data
+    }
+
+    // Extract the IV from the payload (bytes 1..IV_SIZE)
+    uint8_t iv[IV_SIZE];
+    memcpy(iv, payload + 1, IV_SIZE);
+
+    // Ciphertext follows the IV
+    size_t ciphertext_len = payload_len - (1 + IV_SIZE);
+    uint8_t *ciphertext = payload + 1 + IV_SIZE;
+
+    // Setup mbedTLS AES context
+    mbedtls_cipher_context_t ctx;
+    mbedtls_cipher_init(&ctx);
+
+    // Configure cipher for AES-256-CBC
+    const mbedtls_cipher_info_t *cipher_info = mbedtls_cipher_info_from_type(MBEDTLS_CIPHER_AES_256_CBC);
+    if (!cipher_info) {
+        mbedtls_cipher_free(&ctx);
+        return false;
+    }
+
+    if (mbedtls_cipher_setup(&ctx, cipher_info) != 0) {
+        mbedtls_cipher_free(&ctx);
+        return false;
+    }
+
+    if (mbedtls_cipher_setkey(&ctx, shared_aes_key, 256, MBEDTLS_DECRYPT) != 0) {
+        mbedtls_cipher_free(&ctx);
+        return false;
+    }
+
+    if (mbedtls_cipher_set_iv(&ctx, iv, IV_SIZE) != 0) {
+        mbedtls_cipher_free(&ctx);
+        return false;
+    }
+
+    mbedtls_cipher_reset(&ctx);
+
+    // Decrypt the ciphertext
+    std::vector<uint8_t> plaintext(ciphertext_len);
+    size_t output_len = 0;
+    if (mbedtls_cipher_update(&ctx, ciphertext, ciphertext_len, plaintext.data(), &output_len) != 0) {
+        mbedtls_cipher_free(&ctx);
+        return false;
+    }
+
+    size_t final_len = 0;
+    if (mbedtls_cipher_finish(&ctx, plaintext.data() + output_len, &final_len) != 0) {
+        mbedtls_cipher_free(&ctx);
+        return false;
+    }
+    mbedtls_cipher_free(&ctx);
+
+    size_t decrypted_len = output_len + final_len;
+
+    // Replace encrypted payload with decrypted plaintext
+    memcpy(payload, plaintext.data(), decrypted_len);
+
+    // Update the message length to reflect the decrypted payload
+    msg->len = MAVLINK_CORE_HEADER_LEN + decrypted_len + MAVLINK_CHECKSUM_LEN;
+
+    return true;
+}
 
 MavlinkReceiver::~MavlinkReceiver()
 {
@@ -3278,6 +3404,12 @@ MavlinkReceiver::run()
 						if (!(_mavlink.get_status()->flags & MAVLINK_STATUS_FLAG_IN_MAVLINK1)) {
 							/* this will only switch to proto version 2 if allowed in settings */
 							_mavlink.set_proto_version(2);
+						}
+
+						// Attempt to decrypt the payload if it is encrypted.
+						if (!decrypt_mavlink_payload(&msg)) {
+							PX4_ERR("Decryption failed, dropping message (msgid: %d)", msg.msgid);
+							continue;  // Skip processing this message if decryption fails.
 						}
 
 						switch (_mavlink.get_mode()) {

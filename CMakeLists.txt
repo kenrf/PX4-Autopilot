@@ -108,6 +108,19 @@ list(APPEND CMAKE_MODULE_PATH ${PX4_SOURCE_DIR}/cmake)
 include(px4_parse_function_args)
 
 #=============================================================================
+# Add mbedTLS support
+# Find and include mbedTLS
+find_package(mbedTLS REQUIRED)
+
+if (mbedTLS_FOUND)
+    message(STATUS "mbedTLS found: ${mbedTLS_INCLUDE_DIRS}")
+    include_directories(${mbedTLS_INCLUDE_DIRS})
+else()
+    message(FATAL_ERROR "mbedTLS NOT found! Ensure it is installed.")
+endif()
+
+
+#=============================================================================
 # git
 #
 include(px4_git)
@@ -163,6 +176,7 @@ define_property(GLOBAL PROPERTY PX4_SRC_FILES
                  BRIEF_DOCS "src files from all PX4 modules & libs"
                  FULL_DOCS "SRC files from px4_add_{module,library}"
                  )
+
 
 #=============================================================================
 # configuration
@@ -356,6 +370,21 @@ include(px4_metadata)
 add_subdirectory(msg EXCLUDE_FROM_ALL)
 
 px4_generate_airframes_xml(BOARD ${PX4_BOARD})
+
+#=============================================================================
+# MAVLink Module Fix (Ensure mbedTLS is Linked)
+#
+set(MAVLINK_TARGET "modules__mavlink")
+
+if (TARGET ${MAVLINK_TARGET})
+    message(STATUS "Linking mbedTLS to ${MAVLINK_TARGET}")
+    target_link_libraries(${MAVLINK_TARGET} PRIVATE mbedTLS)
+else()
+    message(WARNING "MAVLink target '${MAVLINK_TARGET}' not found at configuration time. Linking skipped.")
+endif()
+
+
+
 
 #=============================================================================
 # external projects

@@ -59,6 +59,16 @@
 #include <uORB/topics/event.h>
 #include "mavlink_receiver.h"
 #include "mavlink_main.h"
+#include "mbedtls/aes.h"
+
+#define AES_KEY_SIZE 32
+#define AES_IV_SIZE 12
+#define AES_TAG_SIZE 12
+
+extern uint8_t shared_aes_key[AES_KEY_SIZE];
+
+void encrypt_mavlink_message(mavlink_message_t* msg);
+void decrypt_mavlink_message(mavlink_message_t* msg);
 
 // Guard against MAVLink misconfiguration
 #ifndef MAVLINK_CRC_EXTRA
@@ -97,6 +107,108 @@ static void usage();
 hrt_abstime Mavlink::_first_start_time = {0};
 
 bool Mavlink::_boot_complete = false;
+
+
+void Mavlink::decrypt_mavlink_message(mavlink_message_t* msg, size_t encrypted_msg_len) {
+    static const size_t IV_SIZE = 16;  // AES block size for AES-256-CBC
+
+    if (encrypted_msg_len < IV_SIZE) {
+        return;  // Invalid message length
+    }
+
+    // Extract IV
+    uint8_t iv[IV_SIZE];
+    memcpy(iv, msg, IV_SIZE);
+
+    // Calculate ciphertext length
+    size_t ciphertext_len = encrypted_msg_len - IV_SIZE;
+    uint8_t* ciphertext = ((uint8_t*)msg) + IV_SIZE;
+
+    // AES decryption context
+    mbedtls_aes_context aes;
+    mbedtls_aes_init(&aes);
+    mbedtls_aes_setkey_dec(&aes, shared_aes_key, 256);
+
+    uint8_t plaintext[MAVLINK_MAX_PAYLOAD_LEN] = {0};
+
+    // Decrypt in CBC mode
+    if (mbedtls_aes_crypt_cbc(&aes, MBEDTLS_AES_DECRYPT, ciphertext_len, iv, ciphertext, plaintext) != 0) {
+        mbedtls_aes_free(&aes);
+        return;  // Decryption failed
+    }
+
+    mbedtls_aes_free(&aes);
+
+    // Overwrite original message with decrypted data
+    memcpy(msg, plaintext, ciphertext_len);
+    msg->len = ciphertext_len;
+}
+
+// Encrypts the MAVLink message in-place.
+// IMPORTANT: This example assumes that your MAVLink message buffer is large enough
+// to include the IV (and later the tag) in addition to the ciphertext.
+void Mavlink::encrypt_mavlink_message(mavlink_message_t* msg) {
+    EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
+    if (!ctx) {
+        // handle error
+        return;
+    }
+
+    // Generate a random IV.
+    uint8_t iv[AES_IV_SIZE];
+    if (RAND_bytes(iv, sizeof(iv)) != 1) {
+        // handle error
+        EVP_CIPHER_CTX_free(ctx);
+        return;
+    }
+
+    // We'll build the output in a temporary buffer.
+    // Reserve the first AES_IV_SIZE bytes for the IV.
+    uint8_t output_buffer[sizeof(mavlink_message_t)] = {0};
+    memcpy(output_buffer, iv, AES_IV_SIZE);
+
+    int out_len = 0;
+    // Initialize encryption context for AES-256-GCM
+    if (EVP_EncryptInit_ex(ctx, EVP_aes_256_gcm(), NULL, shared_aes_key, iv) != 1) {
+        // handle error
+        EVP_CIPHER_CTX_free(ctx);
+        return;
+    }
+
+    // Encrypt the MAVLink message.
+    // (Assume the entire struct is the plaintext. In a more advanced design, you
+    // might only encrypt a specific field.)
+    if (EVP_EncryptUpdate(ctx, output_buffer + AES_IV_SIZE, &out_len,
+                          (const uint8_t*)msg, sizeof(mavlink_message_t)) != 1) {
+        // handle error
+        EVP_CIPHER_CTX_free(ctx);
+        return;
+    }
+
+    int final_len = 0;
+    if (EVP_EncryptFinal_ex(ctx, output_buffer + AES_IV_SIZE + out_len, &final_len) != 1) {
+        // handle error
+        EVP_CIPHER_CTX_free(ctx);
+        return;
+    }
+
+    // Optionally, get the authentication tag and append it
+    uint8_t tag[AES_TAG_SIZE];
+    if (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_GET_TAG, AES_TAG_SIZE, tag) != 1) {
+        // handle error
+        EVP_CIPHER_CTX_free(ctx);
+        return;
+    }
+    EVP_CIPHER_CTX_free(ctx);
+
+    // Now, copy the encrypted data (including IV and tag) back into the message.
+    // For this example, assume your MAVLink message buffer is sized to hold:
+    // [IV (12 bytes)] + [ciphertext (original message size)] + [tag (16 bytes)]
+    // You must adjust MAVLINK_MAX_PACKET_LEN accordingly.
+    memcpy(msg, output_buffer, AES_IV_SIZE + out_len + final_len);
+    // In your code, you may need to update the length of the message to reflect the extra bytes.
+}
+
 
 Mavlink::Mavlink() :
 	ModuleParams(nullptr),
@@ -1021,7 +1133,7 @@ Mavlink::handle_message(const mavlink_message_t *msg)
 	/*
 	 *  NOTE: this is called from the receiver thread
 	 */
-
+	decrypt_mavlink_message(msg);  // Decrypt before processing
 	if (get_forwarding_on()) {
 		/* forward any messages to other mavlink instances */
 		Mavlink::forward_message(msg, this);

@@ -125,7 +125,8 @@ public:
 	 * @return OK on success.
 	 */
 	static int		start(int argc, char *argv[]);
-
+	void decrypt_mavlink_message(mavlink_message_t* msg, size_t encrypted_msg_len);
+	void encrypt_mavlink_message(mavlink_message_t* msg);
 	bool running() const { return _task_running.load(); }
 	bool should_exit() const { return _task_should_exit.load(); }
 	void request_stop()
